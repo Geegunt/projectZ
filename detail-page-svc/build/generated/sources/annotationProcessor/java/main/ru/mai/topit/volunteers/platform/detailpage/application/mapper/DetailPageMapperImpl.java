@@ -10,7 +10,7 @@ import ru.mai.topit.volunteers.platform.detailpage.presentation.http.dto.DetailP
 
 @Generated(
     value = "org.mapstruct.ap.MappingProcessor",
-    date = "2025-11-11T02:22:43+0300",
+    date = "2025-11-11T17:10:52+0300",
     comments = "version: 1.6.3, compiler: IncrementalProcessingEnvironment from gradle-language-java-8.14.3.jar, environment: Java 21.0.8 (Microsoft)"
 )
 @Component

@@ -1,0 +1,1436 @@
+# Подробное объяснение работы проекта user-info-svc
+
+## Оглавление
+1. [Общее описание проекта](#общее-описание-проекта)
+2. [Архитектура проекта](#архитектура-проекта)
+3. [Компоненты системы](#компоненты-системы)
+4. [Поток данных](#поток-данных)
+5. [API Endpoints](#api-endpoints)
+6. [Пошаговая инструкция по проверке работы](#пошаговая-инструкция-по-проверке-работы)
+
+---
+
+## Общее описание проекта
+
+**user-info-svc** — это микросервис для управления пользователями волонтерской платформы. Он предоставляет:
+
+1. **Аутентификацию и авторизацию** — регистрация, вход, обновление токенов, выход
+2. **Управление профилями** — получение и обновление информации о пользователях
+3. **Безопасность** — JWT токены, хеширование паролей, защита endpoints
+4. **Кэширование** — использование Redis для кэширования профилей пользователей
+
+### Технологический стек:
+- **Java 21** — язык программирования
+- **Spring Boot 3.5.5** — фреймворк
+- **PostgreSQL** — база данных
+- **Redis** — кэш и хранилище токенов
+- **JWT** — токены для аутентификации
+- **Liquibase** — миграции базы данных
+- **MapStruct** — маппинг объектов
+- **Swagger/OpenAPI** — документация API
+
+---
+
+## Архитектура проекта
+
+Проект следует принципам **Clean Architecture** и разделен на 4 основных слоя:
+
+```
+┌─────────────────────────────────────────┐
+│   Presentation Layer (HTTP Controllers) │
+│   - AuthController                      │
+│   - ProfileController                   │
+│   - GlobalExceptionHandler              │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│   Application Layer (Business Logic)    │
+│   - AuthService                         │
+│   - ProfileService                      │
+│   - Mappers (UserMapper, ProfileMapper) │
+│   - Factories (UserFactory)             │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│   Domain Layer (Entities)               │
+│   - User                                │
+│   - UserRole                            │
+│   - SocialNetworks                      │
+└─────────────────────────────────────────┘
+                    ↓
+┌─────────────────────────────────────────┐
+│   Infrastructure Layer                  │
+│   - UserRepository (JPA)                │
+│   - RedisProvider                       │
+│   - JwtService, TokenStore              │
+│   - SecurityConfig                      │
+└─────────────────────────────────────────┘
+```
+
+### Принципы работы слоев:
+
+1. **Presentation Layer** — принимает HTTP запросы, валидирует данные, возвращает ответы
+2. **Application Layer** — содержит бизнес-логику, координирует работу между компонентами
+3. **Domain Layer** — содержит сущности и бизнес-правила
+4. **Infrastructure Layer** — работа с БД, внешними сервисами, безопасностью
+
+---
+
+## Компоненты системы
+
+### 1. Domain Layer (Доменный слой)
+
+#### `User.java` — Сущность пользователя
+**Назначение:** JPA-сущность, представляющая пользователя в базе данных.
+
+**Основные поля:**
+- `id` — уникальный идентификатор
+- `login` — логин пользователя (уникальный)
+- `password` — хешированный пароль
+- `fullName` — полное имя
+- `personalEmail`, `maiEmail`, `contactEmail` — различные email адреса
+- `institute`, `studentGroup` — информация об учебе
+- `birthDate` — дата рождения
+- `clothingSize` — размер одежды
+- `social` — JSON поле с социальными сетями (telegram, vk)
+- `role` — роль пользователя (VOLUNTEER, MODERATOR)
+- `createdAt`, `updatedAt` — временные метки
+
+**Особенности:**
+- Использует схему `user_info` в PostgreSQL
+- Поле `social` хранится как JSONB
+- Роль хранится как PostgreSQL enum
+
+#### `UserRole.java` — Роли пользователей
+**Назначение:** Enum для ролей пользователей.
+
+**Значения:**
+- `VOLUNTEER` — волонтер (по умолчанию)
+- `MODERATOR` — модератор
+
+---
+
+### 2. Application Layer (Слой приложения)
+
+#### `AuthService.java` — Сервис аутентификации
+**Назначение:** Управляет регистрацией, входом, обновлением токенов и выходом.
+
+**Методы:**
+
+1. **`register(RegisterRequest request)`**
+   - Проверяет, не существует ли пользователь с таким логином
+   - Создает нового пользователя через фабрику
+   - Хеширует пароль
+   - Сохраняет в БД
+   - Генерирует JWT токены (access и refresh)
+   - Сохраняет refresh токен в Redis
+   - Возвращает оба токена
+
+2. **`login(String login, String password)`**
+   - Находит пользователя по логину
+   - Проверяет пароль (сравнивает хеш)
+   - Генерирует новые JWT токены
+   - Сохраняет refresh токен в Redis
+   - Возвращает токены
+
+3. **`refresh(String refreshToken)`**
+   - Валидирует refresh токен
+   - Проверяет, что токен существует в Redis
+   - Генерирует новые access и refresh токены
+   - Удаляет старый refresh токен из Redis
+   - Сохраняет новый refresh токен
+   - Возвращает новые токены
+
+4. **`logout(String refreshToken)`**
+   - Валидирует refresh токен
+   - Удаляет refresh токен из Redis (отзывает токен)
+
+#### `ProfileService.java` — Сервис профилей
+**Назначение:** Управляет получением и обновлением профилей пользователей.
+
+**Методы:**
+
+1. **`getProfileByLogin(String login)`**
+   - Проверяет кэш в Redis по ключу `user:profile:{login}`
+   - Если есть в кэше — возвращает из кэша
+   - Если нет — получает из БД, преобразует в DTO, сохраняет в кэш
+   - Увеличивает счетчик просмотров (если нужно)
+
+2. **`updateProfileByLogin(String login, ProfileUpdateRequest request)`**
+   - Получает пользователя из БД
+   - Обновляет поля через маппер
+   - Сохраняет в БД
+   - Удаляет старый кэш из Redis
+   - Возвращает обновленный профиль
+
+#### `UserMapper.java` и `ProfileMapper.java` — Мапперы
+**Назначение:** Преобразуют объекты между слоями (Entity ↔ DTO).
+
+**MapStruct** автоматически генерирует реализацию во время компиляции:
+- `toEntity()` — DTO → Entity
+- `toDto()` — Entity → DTO
+- `updateEntityFromRequest()` — обновление Entity из DTO
+
+#### `UserFactory.java` — Фабрика пользователей
+**Назначение:** Создает объекты User из RegisterRequest.
+
+**Процесс:**
+1. Использует UserMapper для базового маппинга
+2. Хеширует пароль через PasswordEncoder
+3. Устанавливает временные метки
+4. Возвращает готовый объект User
+
+---
+
+### 3. Infrastructure Layer (Инфраструктурный слой)
+
+#### `UserRepository.java` — Репозиторий пользователей
+**Назначение:** Spring Data JPA репозиторий для работы с БД.
+
+**Методы:**
+- `findByLogin(String login)` — поиск по логину
+- `existsByLogin(String login)` — проверка существования
+- Стандартные методы JpaRepository (save, findById, delete и т.д.)
+
+#### `JwtService.java` — Сервис JWT токенов
+**Назначение:** Генерация и валидация JWT токенов.
+
+**Методы:**
+
+1. **`issueAccessToken(String subject, Map<String, Object> claims)`**
+   - Создает access токен
+   - Время жизни: 900 секунд (15 минут) — из конфига
+   - Содержит: subject (login), claims (uid), jti (уникальный ID токена)
+   - Подписывается секретным ключом (HMAC SHA-256)
+
+2. **`issueRefreshToken(String subject)`**
+   - Создает refresh токен
+   - Время жизни: 2592000 секунд (30 дней) — из конфига
+   - Содержит: subject (login), jti
+   - Подписывается тем же ключом
+
+3. **`parseAndValidate(String token)`**
+   - Парсит токен
+   - Проверяет подпись
+   - Проверяет срок действия
+   - Возвращает Claims (данные из токена)
+
+#### `TokenStore.java` — Хранилище токенов
+**Назначение:** Управление refresh токенами и черным списком access токенов в Redis.
+
+**Методы:**
+
+1. **`storeRefreshToken(String userId, String refreshToken)`**
+   - Сохраняет refresh токен в Redis
+   - Ключ: `auth:refresh:{userId}:{refreshToken}`
+   - TTL = время жизни refresh токена
+
+2. **`hasRefreshToken(String userId, String refreshToken)`**
+   - Проверяет существование токена в Redis
+
+3. **`revokeRefreshToken(String userId, String refreshToken)`**
+   - Удаляет токен из Redis (отзывает)
+
+4. **`blacklistAccessToken(String jti, long ttlSeconds)`**
+   - Добавляет access токен в черный список
+   - Ключ: `auth:blacklist:{jti}`
+   - Используется при выходе
+
+5. **`isAccessTokenBlacklisted(String jti)`**
+   - Проверяет, находится ли токен в черном списке
+
+#### `RedisProvider.java` — Провайдер Redis
+**Назначение:** Кэширование данных в Redis.
+
+**Методы:**
+
+1. **`getAndCache(String key, Supplier<T> getDataFunc, Class<T> clazz)`**
+   - Проверяет кэш по ключу `op:cache:{key}`
+   - Если есть — десериализует и возвращает
+   - Если нет — вызывает функцию для получения данных, сериализует и сохраняет в кэш
+
+2. **`upsertDataAndEvictCache(String key, Supplier<T> func)`**
+   - Выполняет функцию (обновление данных)
+   - Удаляет старый кэш
+   - Возвращает результат
+
+#### `JwtAuthFilter.java` — Фильтр аутентификации
+**Назначение:** Перехватывает HTTP запросы и проверяет JWT токены.
+
+**Процесс работы:**
+
+1. Извлекает заголовок `Authorization: Bearer {token}`
+2. Если заголовка нет — пропускает запрос дальше
+3. Парсит и валидирует токен через JwtService
+4. Проверяет, не находится ли токен в черном списке
+5. Загружает UserDetails через UserDetailsService
+6. Создает Authentication объект и помещает в SecurityContext
+7. Пропускает запрос дальше
+
+**Важно:** Фильтр применяется ко всем запросам, кроме тех, что в WHITE_LIST.
+
+#### `SecurityConfig.java` — Конфигурация безопасности
+**Назначение:** Настройка Spring Security.
+
+**Настройки:**
+
+1. **WHITE_LIST** — endpoints, доступные без аутентификации:
+   - `/auth/**` — все endpoints аутентификации
+   - `/swagger-ui/**`, `/v3/api-docs/**` — документация
+
+2. **Остальные endpoints** — требуют аутентификации
+
+3. **CORS** — разрешены все origins (для разработки)
+
+4. **Session** — STATELESS (без сессий, только JWT)
+
+5. **CSRF** — отключен (используется JWT)
+
+#### `UserDetailsServiceImpl.java` — Загрузка пользователей для Spring Security
+**Назначение:** Реализует интерфейс UserDetailsService для Spring Security.
+
+**Метод `loadUserByUsername(String username)`:**
+- Находит пользователя по логину
+- Создает UserDetails объект с логином, паролем и ролями
+- Возвращает для Spring Security
+
+---
+
+### 4. Presentation Layer (Слой представления)
+
+#### `AuthController.java` — Контроллер аутентификации
+**Endpoints:**
+
+1. **POST `/auth/signup`** — Регистрация
+   - Принимает: `RegisterRequest` (login, password, опциональные поля)
+   - Возвращает: `TokenResponse` (accessToken, refreshToken)
+   - Публичный endpoint
+
+2. **POST `/auth/login`** — Вход
+   - Принимает: `LoginRequest` (login, password)
+   - Возвращает: `TokenResponse` (accessToken, refreshToken)
+   - Публичный endpoint
+
+3. **POST `/auth/refresh`** — Обновление токенов
+   - Принимает: `RefreshRequest` (refreshToken)
+   - Возвращает: `TokenResponse` (новые accessToken, refreshToken)
+   - Публичный endpoint
+
+4. **POST `/auth/logout`** — Выход
+   - Принимает: `RefreshRequest` (refreshToken)
+   - Возвращает: 204 No Content
+   - Публичный endpoint
+
+#### `ProfileController.java` — Контроллер профилей
+**Endpoints:**
+
+1. **GET `/profile/me`** — Получить свой профиль
+   - Требует: JWT токен в заголовке `Authorization: Bearer {token}`
+   - Возвращает: `ProfileResponse` (все данные профиля)
+   - Защищенный endpoint
+
+2. **PUT `/profile/me`** — Обновить свой профиль
+   - Требует: JWT токен в заголовке
+   - Принимает: `ProfileUpdateRequest` (опциональные поля)
+   - Возвращает: `ProfileResponse` (обновленный профиль)
+   - Защищенный endpoint
+
+#### `GlobalExceptionHandler.java` — Обработчик исключений
+**Назначение:** Централизованная обработка всех исключений.
+
+**Обрабатываемые исключения:**
+
+1. **UserAlreadyExistsException** → 409 Conflict
+2. **InvalidCredentialsException** → 401 Unauthorized
+3. **InvalidRefreshTokenException** → 401 Unauthorized
+4. **UserNotFoundException** → 404 Not Found
+5. **IllegalArgumentException** → 400 Bad Request
+6. **Все остальные** → 500 Internal Server Error
+
+**Формат ответа об ошибке:**
+```json
+{
+  "errorId": "uuid",
+  "timestamp": "2024-01-01T12:00:00Z",
+  "status": 404,
+  "code": "USER_NOT_FOUND",
+  "message": "User with login 'test' not found",
+  "path": "/profile/me"
+}
+```
+
+---
+
+## Поток данных
+
+### Сценарий 1: Регистрация пользователя
+
+```
+1. Клиент → POST /auth/signup
+   {
+     "login": "user123",
+     "password": "password123",
+     "fullName": "Иван Иванов"
+   }
+
+2. AuthController → получает запрос
+   → валидирует через @Valid
+
+3. AuthController → вызывает AuthService.register()
+
+4. AuthService → проверяет существование пользователя
+   → UserRepository.existsByLogin()
+
+5. AuthService → создает пользователя через UserFactory
+   → UserFactory → UserMapper.toEntity()
+   → UserFactory → PasswordEncoder.encode() (хеширование)
+   → UserFactory → устанавливает createdAt, updatedAt
+
+6. AuthService → сохраняет в БД
+   → UserRepository.save()
+
+7. AuthService → генерирует токены
+   → JwtService.issueAccessToken() (15 минут)
+   → JwtService.issueRefreshToken() (30 дней)
+
+8. AuthService → сохраняет refresh токен в Redis
+   → TokenStore.storeRefreshToken()
+   → Redis: auth:refresh:{userId}:{refreshToken}
+
+9. AuthService → возвращает токены
+
+10. AuthController → возвращает TokenResponse клиенту
+```
+
+### Сценарий 2: Получение профиля (с кэшированием)
+
+```
+1. Клиент → GET /profile/me
+   Headers: Authorization: Bearer {accessToken}
+
+2. JwtAuthFilter → перехватывает запрос
+   → извлекает токен из заголовка
+   → JwtService.parseAndValidate() (проверка подписи и срока)
+   → проверяет черный список через TokenStore
+   → UserDetailsService.loadUserByUsername()
+   → создает Authentication и помещает в SecurityContext
+
+3. ProfileController → получает запрос
+   → извлекает login из Authentication.getName()
+
+4. ProfileController → вызывает ProfileService.getProfileByLogin()
+
+5. ProfileService → проверяет кэш в Redis
+   → RedisProvider.getAndCache("user:profile:{login}")
+   → Redis: op:cache:user:profile:{login}
+
+6. Если в кэше нет:
+   → UserRepository.findByLogin()
+   → ProfileMapper.toDto() (Entity → DTO)
+   → сохраняет в Redis кэш
+
+7. Если в кэше есть:
+   → десериализует из Redis
+   → возвращает сразу
+
+8. ProfileService → возвращает ProfileResponse
+
+9. ProfileController → возвращает JSON клиенту
+```
+
+### Сценарий 3: Обновление токенов
+
+```
+1. Клиент → POST /auth/refresh
+   {
+     "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+   }
+
+2. AuthController → вызывает AuthService.refresh()
+
+3. AuthService → валидирует refresh токен
+   → JwtService.parseAndValidate()
+
+4. AuthService → проверяет существование в Redis
+   → TokenStore.hasRefreshToken()
+   → Redis: auth:refresh:{userId}:{refreshToken}
+
+5. Если токен валиден и существует:
+   → генерирует новые токены
+   → JwtService.issueAccessToken()
+   → JwtService.issueRefreshToken()
+
+6. AuthService → отзывает старый refresh токен
+   → TokenStore.revokeRefreshToken() (удаляет из Redis)
+
+7. AuthService → сохраняет новый refresh токен
+   → TokenStore.storeRefreshToken()
+
+8. AuthService → возвращает новые токены
+
+9. AuthController → возвращает TokenResponse клиенту
+```
+
+---
+
+## API Endpoints
+
+### Публичные endpoints (не требуют аутентификации)
+
+#### 1. POST `/auth/signup` — Регистрация
+**Request:**
+```json
+{
+  "login": "user123",
+  "password": "password123",
+  "fullName": "Иван Иванов",
+  "personalEmail": "ivan@example.com",
+  "maiEmail": "ivan@student.mai.ru",
+  "institute": "ИУ",
+  "studentGroup": "ИУ-123",
+  "birthDate": "2000-01-01",
+  "clothingSize": "M",
+  "social": {
+    "telegram": "@ivan",
+    "vk": "vk.com/ivan"
+  },
+  "contactEmail": "ivan@example.com"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+#### 2. POST `/auth/login` — Вход
+**Request:**
+```json
+{
+  "login": "user123",
+  "password": "password123"
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+#### 3. POST `/auth/refresh` — Обновление токенов
+**Request:**
+```json
+{
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+#### 4. POST `/auth/logout` — Выход
+**Request:**
+```json
+{
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+**Response (204 No Content):** (пустое тело)
+
+### Защищенные endpoints (требуют JWT токен)
+
+#### 5. GET `/profile/me` — Получить свой профиль
+**Headers:**
+```
+Authorization: Bearer {accessToken}
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": 1,
+  "login": "user123",
+  "fullName": "Иван Иванов",
+  "personalEmail": "ivan@example.com",
+  "maiEmail": "ivan@student.mai.ru",
+  "institute": "ИУ",
+  "studentGroup": "ИУ-123",
+  "birthDate": "2000-01-01",
+  "clothingSize": "M",
+  "social": {
+    "telegram": "@ivan",
+    "vk": "vk.com/ivan"
+  },
+  "contactEmail": "ivan@example.com",
+  "role": "VOLUNTEER"
+}
+```
+
+#### 6. PUT `/profile/me` — Обновить профиль
+**Headers:**
+```
+Authorization: Bearer {accessToken}
+```
+
+**Request:**
+```json
+{
+  "fullName": "Иван Петров",
+  "institute": "ИУ-2",
+  "social": {
+    "telegram": "@newivan",
+    "vk": "vk.com/newivan"
+  }
+}
+```
+
+**Response (200 OK):**
+```json
+{
+  "id": 1,
+  "login": "user123",
+  "fullName": "Иван Петров",
+  ...
+}
+```
+
+---
+
+## Пошаговая инструкция по проверке работы
+
+### Шаг 1: Подготовка окружения
+
+#### 1.1. Проверка Java
+```bash
+java -version
+```
+**Ожидаемый результат:** Java version "21" или выше
+
+**Если Java не установлена:**
+- macOS: `brew install openjdk@21`
+- Или скачайте с https://adoptium.net/
+
+#### 1.2. Проверка Docker
+```bash
+docker --version
+docker compose version
+```
+**Ожидаемый результат:** Версии Docker и Docker Compose
+
+**Если Docker не установлен:**
+- macOS: `brew install --cask docker`
+- Или скачайте Docker Desktop: https://www.docker.com/products/docker-desktop
+- Запустите Docker Desktop и дождитесь полной загрузки
+
+#### 1.3. Переход в директорию проекта
+```bash
+cd /Users/glebgrigorev/Desktop/programming/projectEpsilan/user-info-svc
+```
+
+---
+
+### Шаг 2: Запуск зависимостей (PostgreSQL и Redis)
+
+#### 2.1. Запуск Docker контейнеров
+```bash
+docker compose -f docker/docker-compose.yml up -d
+```
+
+**Что происходит:**
+- Запускается PostgreSQL на порту 25432
+- Запускается Redis на порту 6380
+- Выполняются Liquibase миграции для создания схемы БД
+
+**Ожидаемый вывод:**
+```
+[+] Running 3/3
+ ✔ Container postgresDb      Started
+ ✔ Container migrations      Started
+ ✔ Container redis_container Started
+```
+
+#### 2.2. Проверка статуса контейнеров
+```bash
+docker compose -f docker/docker-compose.yml ps
+```
+
+**Ожидаемый результат:**
+```
+NAME              STATUS
+postgresDb        Up
+migrations        Exited (0)
+redis_container   Up
+```
+
+**Объяснение:**
+- `postgresDb` и `redis_container` должны быть в статусе "Up"
+- `migrations` должен быть "Exited (0)" — это нормально, миграции выполнились успешно
+
+#### 2.3. Проверка логов (если что-то не так)
+```bash
+docker compose -f docker/docker-compose.yml logs
+```
+
+**Если видите ошибки:**
+- Проверьте, что порты 25432 и 6380 свободны
+- Убедитесь, что Docker Desktop запущен
+
+#### 2.4. Проверка подключения к PostgreSQL
+```bash
+docker exec -it postgresDb psql -U userinfo -d userinfo_db -c "SELECT 1;"
+```
+
+**Ожидаемый результат:**
+```
+ ?column?
+----------
+        1
+(1 row)
+```
+
+**Если ошибка:**
+- Подождите несколько секунд — PostgreSQL может еще запускаться
+- Проверьте логи: `docker compose -f docker/docker-compose.yml logs postgres-db`
+
+#### 2.5. Проверка схемы базы данных
+```bash
+docker exec -it postgresDb psql -U userinfo -d userinfo_db -c "\dn"
+```
+
+**Ожидаемый результат:** Должна быть схема `user_info`
+
+```bash
+docker exec -it postgresDb psql -U userinfo -d userinfo_db -c "\dt user_info.*"
+```
+
+**Ожидаемый результат:** Должна быть таблица `users`
+
+---
+
+### Шаг 3: Запуск приложения
+
+#### 3.1. Сборка проекта (опционально, но рекомендуется)
+```bash
+./gradlew clean build -x test
+```
+
+**Ожидаемый результат:**
+```
+BUILD SUCCESSFUL in Xs
+```
+
+**Объяснение:** Это убедится, что проект компилируется без ошибок.
+
+#### 3.2. Запуск приложения
+```bash
+./gradlew bootRun
+```
+
+**Ожидаемый вывод:**
+```
+> Task :bootRun
+
+  .   ____          _            __ _ _
+ /\\ / ___'_ __ _ _(_)_ __  __ _ \ \ \ \
+( ( )\___ | '_ | '_| | '_ \/ _` | \ \ \ \
+ \\/  ___)| |_)| | | | | || (_| |  ) ) ) )
+  '  |____| .__|_| |_|_| |_\__, | / / / /
+ =========|_|==============|___/=/_/_/_/
+ :: Spring Boot ::                (v3.5.5)
+
+... (много логов Spring Boot)
+
+Started UserInfoApplication in X.XXX seconds
+```
+
+**Важно:** Не закрывайте этот терминал! Приложение должно продолжать работать.
+
+**Если видите ошибки подключения к БД:**
+- Убедитесь, что PostgreSQL запущен: `docker compose -f docker/docker-compose.yml ps`
+- Проверьте, что порт 25432 доступен
+
+**Если видите ошибки подключения к Redis:**
+- Убедитесь, что Redis запущен
+- Проверьте, что порт 6380 доступен
+
+#### 3.3. Проверка, что приложение запущено
+Откройте новый терминал (не закрывая первый) и выполните:
+
+```bash
+curl http://localhost:8080/swagger-ui
+```
+
+**Ожидаемый результат:** HTML страница Swagger UI (или редирект)
+
+**Альтернативная проверка:**
+```bash
+curl http://localhost:8080/v3/api-docs
+```
+
+**Ожидаемый результат:** JSON с описанием API
+
+---
+
+### Шаг 4: Проверка работы через Swagger UI
+
+#### 4.1. Открытие Swagger UI
+Откройте в браузере:
+```
+http://localhost:8080/swagger-ui
+```
+
+**Что вы увидите:**
+- Список всех доступных endpoints
+- Описание каждого endpoint
+- Возможность выполнить запросы прямо из браузера
+
+#### 4.2. Изучение API документации
+В Swagger UI вы увидите:
+- **Auth Controller** — endpoints для аутентификации
+- **Profile Controller** — endpoints для работы с профилем
+
+---
+
+### Шаг 5: Тестирование API через curl (пошагово)
+
+#### 5.1. Регистрация нового пользователя
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login": "testuser",
+    "password": "testpassword123",
+    "fullName": "Тестовый Пользователь",
+    "personalEmail": "test@example.com",
+    "institute": "ИУ",
+    "studentGroup": "ИУ-123"
+  }'
+```
+
+**Ожидаемый результат (200 OK):**
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0dXNlciIsInVpZCI6MSwianRpIjoi...",
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJ0ZXN0dXNlciIsImp0aSI6Ii4uLiJ9..."
+}
+```
+
+**Что произошло:**
+1. Приложение получило запрос на регистрацию
+2. Проверило, что пользователь с таким логином не существует
+3. Создало нового пользователя в БД
+4. Захешировало пароль
+5. Сгенерировало JWT токены
+6. Сохранило refresh токен в Redis
+7. Вернуло токены клиенту
+
+**Сохранение токенов для дальнейшего использования:**
+```bash
+# Сохраните accessToken в переменную (замените на реальный токен из ответа)
+export ACCESS_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+
+# Сохраните refreshToken
+export REFRESH_TOKEN="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+```
+
+**Проверка в базе данных:**
+```bash
+docker exec -it postgresDb psql -U userinfo -d userinfo_db -c "SELECT id, login, full_name FROM user_info.users WHERE login = 'testuser';"
+```
+
+**Ожидаемый результат:**
+```
+ id |  login   |      full_name
+----+----------+-------------------
+  1 | testuser | Тестовый Пользователь
+(1 row)
+```
+
+**Важно:** Пароль в БД будет захеширован, вы не увидите исходный пароль.
+
+#### 5.2. Попытка регистрации с тем же логином (проверка валидации)
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login": "testuser",
+    "password": "anotherpassword"
+  }'
+```
+
+**Ожидаемый результат (409 Conflict):**
+```json
+{
+  "errorId": "uuid-здесь",
+  "timestamp": "2024-01-01T12:00:00Z",
+  "status": 409,
+  "code": "USER_EXISTS",
+  "message": "User with login testuser already exists",
+  "path": "/auth/signup"
+}
+```
+
+**Что произошло:**
+1. Приложение проверило существование пользователя
+2. Обнаружило, что пользователь уже существует
+3. Выбросило исключение `UserAlreadyExistsException`
+4. `GlobalExceptionHandler` перехватил исключение
+5. Вернул структурированный ответ об ошибке
+
+#### 5.3. Вход (login) существующего пользователя
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login": "testuser",
+    "password": "testpassword123"
+  }'
+```
+
+**Ожидаемый результат (200 OK):**
+```json
+{
+  "accessToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "refreshToken": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+}
+```
+
+**Что произошло:**
+1. Приложение нашло пользователя по логину
+2. Сравнило введенный пароль с хешем в БД
+3. Пароль совпал
+4. Сгенерировало новые токены
+5. Сохранило новый refresh токен в Redis
+6. Вернуло токены
+
+**Обновите переменные:**
+```bash
+export ACCESS_TOKEN="новый_токен_из_ответа"
+export REFRESH_TOKEN="новый_токен_из_ответа"
+```
+
+#### 5.4. Попытка входа с неверным паролем
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "login": "testuser",
+    "password": "wrongpassword"
+  }'
+```
+
+**Ожидаемый результат (401 Unauthorized):**
+```json
+{
+  "errorId": "uuid-здесь",
+  "timestamp": "2024-01-01T12:00:00Z",
+  "status": 401,
+  "code": "INVALID_CREDENTIALS",
+  "message": "Invalid credentials",
+  "path": "/auth/login"
+}
+```
+
+**Что произошло:**
+1. Приложение нашло пользователя
+2. Сравнило пароль с хешем
+3. Пароль не совпал
+4. Выбросило `InvalidCredentialsException`
+5. Вернуло ошибку 401
+
+#### 5.5. Получение своего профиля (защищенный endpoint)
+
+**Команда:**
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Ожидаемый результат (200 OK):**
+```json
+{
+  "id": 1,
+  "login": "testuser",
+  "fullName": "Тестовый Пользователь",
+  "personalEmail": "test@example.com",
+  "maiEmail": null,
+  "institute": "ИУ",
+  "studentGroup": "ИУ-123",
+  "birthDate": null,
+  "clothingSize": null,
+  "social": {
+    "telegram": null,
+    "vk": null
+  },
+  "contactEmail": null,
+  "role": "VOLUNTEER"
+}
+```
+
+**Что произошло:**
+1. `JwtAuthFilter` перехватил запрос
+2. Извлек токен из заголовка `Authorization: Bearer ...`
+3. Валидировал токен через `JwtService`
+4. Проверил черный список
+5. Загрузил `UserDetails` через `UserDetailsService`
+6. Создал `Authentication` и поместил в `SecurityContext`
+7. `ProfileController` получил запрос
+8. Извлек login из `Authentication.getName()`
+9. `ProfileService` проверил кэш в Redis
+10. Если нет в кэше — получил из БД, сохранил в кэш
+11. Вернул профиль
+
+**Проверка кэша в Redis:**
+```bash
+docker exec -it redis_container redis-cli -a redispassword KEYS "op:cache:user:profile:testuser"
+```
+
+**Ожидаемый результат:** Ключ должен существовать
+
+#### 5.6. Попытка получить профиль без токена
+
+**Команда:**
+```bash
+curl -X GET http://localhost:8080/profile/me
+```
+
+**Ожидаемый результат (401 Unauthorized):**
+```json
+{
+  "timestamp": "2024-01-01T12:00:00Z",
+  "status": 401,
+  "error": "Unauthorized",
+  "path": "/profile/me"
+}
+```
+
+**Что произошло:**
+1. `JwtAuthFilter` не нашел токен в заголовке
+2. Не создал `Authentication`
+3. Spring Security отклонил запрос
+4. Вернул 401 Unauthorized
+
+#### 5.7. Обновление профиля
+
+**Команда:**
+```bash
+curl -X PUT http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "fullName": "Обновленное Имя",
+    "institute": "ИУ-2",
+    "social": {
+      "telegram": "@testuser",
+      "vk": "vk.com/testuser"
+    }
+  }'
+```
+
+**Ожидаемый результат (200 OK):**
+```json
+{
+  "id": 1,
+  "login": "testuser",
+  "fullName": "Обновленное Имя",
+  "personalEmail": "test@example.com",
+  "maiEmail": null,
+  "institute": "ИУ-2",
+  "studentGroup": "ИУ-123",
+  "birthDate": null,
+  "clothingSize": null,
+  "social": {
+    "telegram": "@testuser",
+    "vk": "vk.com/testuser"
+  },
+  "contactEmail": null,
+  "role": "VOLUNTEER"
+}
+```
+
+**Что произошло:**
+1. Приложение аутентифицировало пользователя
+2. `ProfileService` получил пользователя из БД
+3. Обновил поля через `ProfileMapper`
+4. Сохранил в БД
+5. Удалил старый кэш из Redis (чтобы при следующем запросе данные обновились)
+6. Вернул обновленный профиль
+
+**Проверка в базе данных:**
+```bash
+docker exec -it postgresDb psql -U userinfo -d userinfo_db -c "SELECT full_name, institute, social FROM user_info.users WHERE login = 'testuser';"
+```
+
+**Ожидаемый результат:** Данные должны быть обновлены
+
+**Проверка, что кэш удален:**
+```bash
+docker exec -it redis_container redis-cli -a redispassword KEYS "op:cache:user:profile:testuser"
+```
+
+**Ожидаемый результат:** Ключ не должен существовать (был удален при обновлении)
+
+#### 5.8. Повторное получение профиля (проверка кэширования)
+
+**Команда:**
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Что произошло:**
+1. `ProfileService` проверил кэш — его нет (был удален)
+2. Получил данные из БД (с обновленными полями)
+3. Сохранил в кэш Redis
+4. Вернул профиль
+
+**Повторный запрос:**
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Что произошло:**
+1. `ProfileService` проверил кэш — нашел данные
+2. Десериализовал из Redis
+3. Вернул из кэша (без обращения к БД)
+
+#### 5.9. Обновление токенов (refresh)
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"refreshToken\": \"$REFRESH_TOKEN\"
+  }"
+```
+
+**Ожидаемый результат (200 OK):**
+```json
+{
+  "accessToken": "новый_access_token",
+  "refreshToken": "новый_refresh_token"
+}
+```
+
+**Что произошло:**
+1. `JwtService` валидировал refresh токен
+2. `TokenStore` проверил существование токена в Redis
+3. Сгенерировал новые access и refresh токены
+4. Удалил старый refresh токен из Redis
+5. Сохранил новый refresh токен в Redis
+6. Вернул новые токены
+
+**Обновите переменные:**
+```bash
+export ACCESS_TOKEN="новый_access_token"
+export REFRESH_TOKEN="новый_refresh_token"
+```
+
+**Проверка в Redis:**
+```bash
+# Старый токен должен быть удален
+docker exec -it redis_container redis-cli -a redispassword KEYS "auth:refresh:*"
+
+# Должен быть только новый токен
+```
+
+#### 5.10. Попытка использовать старый refresh токен
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"refreshToken\": \"старый_refresh_token\"
+  }"
+```
+
+**Ожидаемый результат (401 Unauthorized):**
+```json
+{
+  "errorId": "uuid-здесь",
+  "timestamp": "2024-01-01T12:00:00Z",
+  "status": 401,
+  "code": "INVALID_REFRESH_TOKEN",
+  "message": "Invalid refresh token",
+  "path": "/auth/refresh"
+}
+```
+
+**Что произошло:**
+1. Токен был валиден по подписи
+2. Но `TokenStore` не нашел его в Redis (был удален при refresh)
+3. Выбросило `InvalidRefreshTokenException`
+4. Вернуло ошибку 401
+
+#### 5.11. Выход (logout)
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/logout \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"refreshToken\": \"$REFRESH_TOKEN\"
+  }"
+```
+
+**Ожидаемый результат (204 No Content):** Пустое тело ответа
+
+**Что произошло:**
+1. `JwtService` валидировал refresh токен
+2. `TokenStore` удалил токен из Redis
+3. Токен больше не может быть использован для refresh
+
+**Проверка в Redis:**
+```bash
+docker exec -it redis_container redis-cli -a redispassword KEYS "auth:refresh:*"
+```
+
+**Ожидаемый результат:** Токен должен быть удален
+
+#### 5.12. Попытка использовать токен после выхода
+
+**Команда:**
+```bash
+curl -X POST http://localhost:8080/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"refreshToken\": \"$REFRESH_TOKEN\"
+  }"
+```
+
+**Ожидаемый результат (401 Unauthorized):** Токен не найден в Redis
+
+---
+
+### Шаг 6: Проверка работы через Swagger UI
+
+#### 6.1. Открытие Swagger UI
+```
+http://localhost:8080/swagger-ui
+```
+
+#### 6.2. Регистрация через Swagger
+1. Найдите endpoint `POST /auth/signup`
+2. Нажмите "Try it out"
+3. Заполните JSON (можно использовать пример выше)
+4. Нажмите "Execute"
+5. Скопируйте `accessToken` из ответа
+
+#### 6.3. Авторизация в Swagger
+1. Нажмите кнопку "Authorize" вверху страницы
+2. Вставьте `accessToken` в поле "Value"
+3. Нажмите "Authorize"
+4. Закройте окно
+
+#### 6.4. Получение профиля через Swagger
+1. Найдите endpoint `GET /profile/me`
+2. Нажмите "Try it out"
+3. Нажмите "Execute"
+4. Вы увидите свой профиль
+
+#### 6.5. Обновление профиля через Swagger
+1. Найдите endpoint `PUT /profile/me`
+2. Нажмите "Try it out"
+3. Заполните JSON с полями для обновления
+4. Нажмите "Execute"
+5. Вы увидите обновленный профиль
+
+---
+
+### Шаг 7: Проверка работы кэширования
+
+#### 7.1. Включение логирования SQL (опционально)
+В `application.yml` можно временно добавить:
+```yaml
+spring:
+  jpa:
+    show-sql: true
+```
+
+Перезапустите приложение.
+
+#### 7.2. Первый запрос профиля
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**В логах приложения:** Должен быть SQL запрос `SELECT ... FROM user_info.users`
+
+#### 7.3. Второй запрос профиля (из кэша)
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**В логах приложения:** SQL запроса НЕ должно быть (данные из Redis)
+
+#### 7.4. Обновление профиля
+```bash
+curl -X PUT http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"fullName": "Новое имя"}'
+```
+
+**В логах приложения:** Должен быть SQL запрос `UPDATE ...`
+
+#### 7.5. Следующий запрос профиля
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**В логах приложения:** Должен быть SQL запрос (кэш был удален, данные обновлены)
+
+---
+
+### Шаг 8: Проверка работы токенов
+
+#### 8.1. Проверка времени жизни access токена
+Access токен живет 15 минут (900 секунд).
+
+**Проверка:**
+1. Получите токен через login
+2. Подождите 16 минут
+3. Попробуйте использовать токен:
+```bash
+curl -X GET http://localhost:8080/profile/me \
+  -H "Authorization: Bearer $ACCESS_TOKEN"
+```
+
+**Ожидаемый результат (401 Unauthorized):** Токен истек
+
+#### 8.2. Обновление истекшего access токена
+```bash
+curl -X POST http://localhost:8080/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"refreshToken\": \"$REFRESH_TOKEN\"
+  }"
+```
+
+**Ожидаемый результат:** Новые токены
+
+---
+
+### Шаг 9: Остановка сервисов
+
+#### 9.1. Остановка приложения
+В терминале, где запущено приложение, нажмите `Ctrl+C`
+
+#### 9.2. Остановка Docker контейнеров
+```bash
+docker compose -f docker/docker-compose.yml down
+```
+
+**Остановка с удалением данных:**
+```bash
+docker compose -f docker/docker-compose.yml down -v
+```
+
+**Внимание:** Это удалит все данные из БД и Redis!
+
+---
+
+## Часто встречающиеся проблемы и решения
+
+### Проблема 1: "Connection refused" к PostgreSQL
+**Причина:** PostgreSQL не запущен или порт занят
+
+**Решение:**
+```bash
+# Проверьте статус
+docker compose -f docker/docker-compose.yml ps
+
+# Перезапустите
+docker compose -f docker/docker-compose.yml restart postgres-db
+
+# Проверьте логи
+docker compose -f docker/docker-compose.yml logs postgres-db
+```
+
+### Проблема 2: "Connection refused" к Redis
+**Причина:** Redis не запущен
+
+**Решение:**
+```bash
+docker compose -f docker/docker-compose.yml restart redis
+docker compose -f docker/docker-compose.yml logs redis
+```
+
+### Проблема 3: "Schema 'user_info' does not exist"
+**Причина:** Миграции не выполнились
+
+**Решение:**
+```bash
+# Проверьте логи миграций
+docker compose -f docker/docker-compose.yml logs migrations
+
+# Перезапустите миграции
+docker compose -f docker/docker-compose.yml up migrations
+```
+
+### Проблема 4: "Port already in use"
+**Причина:** Порт 8080, 25432 или 6380 занят другим процессом
+
+**Решение:**
+```bash
+# Найдите процесс на порту 8080
+lsof -i :8080
+
+# Убейте процесс (замените PID)
+kill -9 PID
+
+# Или измените порт в application.yml
+```
+
+### Проблема 5: "Invalid JWT token"
+**Причина:** Токен истек или неверный
+
+**Решение:**
+- Получите новый токен через `/auth/login` или `/auth/refresh`
+- Убедитесь, что используете правильный формат: `Bearer {token}`
+
+---
+
+## Заключение
+
+Вы успешно:
+1. ✅ Запустили все зависимости (PostgreSQL, Redis)
+2. ✅ Запустили приложение
+3. ✅ Протестировали все основные функции:
+   - Регистрация пользователей
+   - Вход в систему
+   - Получение профиля
+   - Обновление профиля
+   - Обновление токенов
+   - Выход из системы
+4. ✅ Проверили работу кэширования
+5. ✅ Проверили работу безопасности (JWT токены)
+
+Проект работает корректно! 🎉
+

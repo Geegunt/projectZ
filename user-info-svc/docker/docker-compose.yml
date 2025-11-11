@@ -1,0 +1,5 @@
+﻿include:
+  - './postgres/docker-compose.postgres.yml'
+  - './networks/docker-compose.networks.yml'
+  - './redis/docker-compose.redis.yaml'
+#  - './kafka/docker-compose.redis.yaml'

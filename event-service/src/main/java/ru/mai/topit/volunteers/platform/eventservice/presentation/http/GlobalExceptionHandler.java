@@ -9,7 +9,6 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
-import ru.mai.topit.volunteers.platform.eventservice.application.exception.DetailPageNotFoundException;
 
 import java.time.OffsetDateTime;
 import java.util.HashMap;
@@ -24,16 +23,6 @@ import java.util.UUID;
 @Hidden
 @Slf4j
 public class GlobalExceptionHandler {
-
-    /**
-     * Обрабатывает исключение, когда детальная страница не найдена.
-     */
-    @ExceptionHandler(DetailPageNotFoundException.class)
-    public ResponseEntity<Object> handleDetailPageNotFound(
-            DetailPageNotFoundException ex,
-            HttpServletRequest request) {
-        return error(request, HttpStatus.NOT_FOUND, "DETAIL_PAGE_NOT_FOUND", ex.getMessage(), null);
-    }
 
     /**
      * Обрабатывает ошибки валидации при проверке DTO.

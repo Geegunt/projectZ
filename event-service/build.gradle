@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'org.springframework.boot' version '3.5.5'
     id 'io.spring.dependency-management' version '1.1.7'
+    id 'org.flywaydb.flyway' version '10.18.2'
 }
 
 group = 'ru.mai.topit.volunteers.platform'
@@ -39,6 +40,8 @@ dependencies {
     implementation 'org.springframework.boot:spring-boot-starter-validation'
     implementation 'org.springframework.cloud:spring-cloud-starter-openfeign'
     implementation 'org.springframework.boot:spring-boot-starter-data-redis'
+    implementation 'org.flywaydb:flyway-core'
+    implementation 'org.flywaydb:flyway-database-postgresql'
     developmentOnly 'org.springframework.boot:spring-boot-devtools'
     runtimeOnly 'org.postgresql:postgresql'
     implementation("com.fasterxml.jackson.datatype:jackson-datatype-jsr310:2.6.3")
@@ -72,6 +75,17 @@ dependencyManagement {
 
 tasks.named('test') {
     useJUnitPlatform()
+}
+
+// Flyway configuration
+flyway {
+    url = 'jdbc:postgresql://localhost:25433/eventservice_db'
+    user = 'eventservice'
+    password = 'password'
+    schemas = ['event_service']
+    locations = ['classpath:db/migration']
+    baselineOnMigrate = true
+    validateOnMigrate = true
 }
 
 

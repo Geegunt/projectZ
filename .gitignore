@@ -1,0 +1,56 @@
+# Build artifacts
+build/
+.gradle/
+*.jar
+*.war
+*.nar
+*.ear
+*.zip
+*.tar.gz
+*.rar
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.iml
+*.iws
+*.ipr
+.DS_Store
+
+# System files
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# Maven
+target/
+pom.xml.tag
+pom.xml.releaseBackup
+
+# Logs
+logs/
+*.log
+
+# Node (if using npm)
+node_modules/
+
+# JVM
+*.class
+*.jar
+*.war
+
+# Gradle
+gradlew
+gradlew.bat
+gradle/
+
+# Test coverage
+coverage/
+.coverage
+
+# Runtime
+*.pid
+*.pid.lock

@@ -38,8 +38,9 @@ docker compose -f docker/docker-compose.yml down
 
 ## Основные компоненты
 
-- **EventService** - основной сервис для работы с событиями
-- **DetailPageController** - REST API endpoints
+- **Event** - основная сущность события
+- **Category** - категория события
+- **EventApplication** - заявка на участие в событии
 - **PostgreSQL** - хранилище данных
 - **OpenAPI/Swagger** - документация API
 

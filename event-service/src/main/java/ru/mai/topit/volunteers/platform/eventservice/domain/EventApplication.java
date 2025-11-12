@@ -13,9 +13,6 @@ import org.hibernate.type.SqlTypes;
 import java.time.OffsetDateTime;
 import java.util.Map;
 
-/**
- * Сущность, представляющая заявку на участие в событии.
- */
 @Data
 @Builder
 @NoArgsConstructor
@@ -29,77 +26,108 @@ public class EventApplication {
     @Column(name = "id", nullable = false)
     private Long id;
 
-    /**
-     * Событие, на которое подана заявка
-     */
     @NotNull
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "event_id", nullable = false, referencedColumnName = "id")
     private Event event;
 
-    /**
-     * ID пользователя, подавшего заявку
-     */
     @NotNull
     @Column(name = "user_id", nullable = false)
     private Long userId;
 
-    /**
-     * Статус заявки (pending, approved, rejected, cancelled)
-     */
     @ColumnDefault("'pending'")
     @Column(name = "status", nullable = false, length = 20)
     private String status;
 
-    /**
-     * Дата подачи заявки
-     */
     @ColumnDefault("now()")
     @Column(name = "application_date", nullable = false)
     private OffsetDateTime applicationDate;
 
-    /**
-     * Контактная информация заявителя в JSON
-     */
     @Column(name = "contact_info")
     @JdbcTypeCode(SqlTypes.JSON)
     private Map<String, Object> contactInfo;
 
-    /**
-     * Сообщение от заявителя
-     */
     @Column(name = "message", columnDefinition = "TEXT")
     private String message;
 
-    /**
-     * ID пользователя, который рассмотрел заявку
-     */
     @Column(name = "reviewed_by")
     private Long reviewedBy;
 
-    /**
-     * Дата рассмотрения заявки
-     */
     @Column(name = "review_date")
     private OffsetDateTime reviewDate;
 
-    /**
-     * Комментарий при рассмотрении
-     */
     @Column(name = "review_comment", columnDefinition = "TEXT")
     private String reviewComment;
 
-    /**
-     * Дата и время создания
-     */
     @ColumnDefault("now()")
     @Column(name = "created_at", nullable = false)
     private OffsetDateTime createdAt;
 
-    /**
-     * Дата и время последнего обновления
-     */
     @ColumnDefault("now()")
     @Column(name = "updated_at", nullable = false)
     private OffsetDateTime updatedAt;
+
+    public static EventApplication apply(Event event, Long userId) {
+        if (event == null) {
+            throw new IllegalArgumentException("Event cannot be null");
+        }
+        if (userId == null || userId <= 0) {
+            throw new IllegalArgumentException("User ID must be positive");
+        }
+        if (!event.canRegister()) {
+            throw new IllegalStateException("Cannot apply to this event: event is not available for registration");
+        }
+
+        return EventApplication.builder()
+                .event(event)
+                .userId(userId)
+                .status(EventApplicationStatus.PENDING.getValue())
+                .applicationDate(OffsetDateTime.now())
+                .createdAt(OffsetDateTime.now())
+                .updatedAt(OffsetDateTime.now())
+                .build();
+    }
+
+    public void approve(Long reviewerId) {
+        if (reviewerId == null || reviewerId <= 0) {
+            throw new IllegalArgumentException("Reviewer ID must be positive");
+        }
+        if (!EventApplicationStatus.PENDING.getValue().equals(this.status)) {
+            throw new IllegalStateException("Only pending applications can be approved");
+        }
+        this.status = EventApplicationStatus.APPROVED.getValue();
+        this.reviewedBy = reviewerId;
+        this.reviewDate = OffsetDateTime.now();
+        this.updatedAt = OffsetDateTime.now();
+    }
+
+    public void reject(Long reviewerId, String comment) {
+        if (reviewerId == null || reviewerId <= 0) {
+            throw new IllegalArgumentException("Reviewer ID must be positive");
+        }
+        if (!EventApplicationStatus.PENDING.getValue().equals(this.status)) {
+            throw new IllegalStateException("Only pending applications can be rejected");
+        }
+        this.status = EventApplicationStatus.REJECTED.getValue();
+        this.reviewedBy = reviewerId;
+        this.reviewDate = OffsetDateTime.now();
+        this.reviewComment = comment;
+        this.updatedAt = OffsetDateTime.now();
+    }
+
+    public void cancel() {
+        if (EventApplicationStatus.CANCELLED.getValue().equals(this.status)) {
+            throw new IllegalStateException("Application is already cancelled");
+        }
+        this.status = EventApplicationStatus.CANCELLED.getValue();
+        this.updatedAt = OffsetDateTime.now();
+    }
+
+    public boolean isPending() {
+        return EventApplicationStatus.PENDING.getValue().equals(this.status);
+    }
+
+    public boolean isApproved() {
+        return EventApplicationStatus.APPROVED.getValue().equals(this.status);
+    }
 }

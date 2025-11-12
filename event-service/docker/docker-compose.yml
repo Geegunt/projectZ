@@ -1,0 +1,28 @@
+services:
+  postgres-db:
+    container_name: postgresDb-eventservice
+    image: postgres:16.0
+    environment:
+      POSTGRES_USER: eventservice
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: eventservice_db
+    healthcheck:
+      test: /usr/bin/pg_isready
+      interval: 5s
+      timeout: 10s
+      retries: 120
+    ports:
+      - '25433:5432'
+    volumes:
+      - postgres-data-event-service:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - event-service-network
+
+volumes:
+  postgres-data-event-service:
+
+networks:
+  event-service-network:
+    driver: bridge
+
